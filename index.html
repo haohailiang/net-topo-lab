@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>net-topo-lab · 多层拓扑分层懒加载演示</title>
+  </head>
+  <body>
+    <link rel="icon" href="data:," />
+    <div id="root">
+      <div
+        style="height:100vh;display:flex;align-items:center;justify-content:center;font-family:-apple-system,'Microsoft YaHei',sans-serif;font-size:13px;color:#61728a"
+      >
+        正在加载拓扑演示…
+      </div>
+    </div>
+    <script>
+      // 开发期错误可视化：任何未捕获异常直接打印到页面上，
+      // 避免“白屏但不知道原因”。上线前可删除。
+      (function () {
+        function show(tag, text) {
+          var d = document.createElement('div');
+          d.setAttribute('data-errdbg', tag);
+          d.style.cssText =
+            'position:fixed;left:0;top:0;right:0;z-index:9999;background:#fff1f0;color:#a8071a;' +
+            'font:12px/1.5 monospace;padding:8px 12px;white-space:pre-wrap;border-bottom:1px solid #ffa39e';
+          d.textContent = tag + ': ' + text;
+          document.body.insertBefore(d, document.body.firstChild);
+        }
+        window.addEventListener('error', function (e) {
+          show('JS_ERROR', (e.message || '') + ' @ ' + (e.filename || '') + ':' + (e.lineno || '') + ':' + (e.colno || ''));
+        });
+        window.addEventListener('unhandledrejection', function (e) {
+          var r = e.reason;
+          show('UNHANDLED_REJECTION', String((r && (r.stack || r.message)) || r));
+        });
+      })();
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

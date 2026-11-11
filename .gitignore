@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.vite/
+*.log
+.DS_Store
+
+# 调试与验证产物
+.shot-*.png
+.verify-*.png
+.dom.html
+
+# 编辑器
+.vscode/
+.idea/
