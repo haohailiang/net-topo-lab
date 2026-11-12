@@ -1,408 +1,501 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+/**
+ * 演示主界面。
+ *
+ * 四层拓扑纵向堆叠，每层一张独立的图、固定 340px 高，超出部分整页滚动。
+ * 每层由「路径」唯一确定：点链路 / 点域 / 点整层详情，都会在下面接一层新的图。
+ * 同层再点另一个入口时，原来的这张子图连同它下面所有层整棵销毁。
+ */
+import { computed, onMounted, reactive, ref } from 'vue';
 import TopoGraph from './components/TopoGraph.vue';
-import { LAYOUT_KEYS, LAYOUT_LABELS, type LayoutKey } from './components/layouts';
+import { buildLayer, findLink, pathKey, SCALES, SCALE_KEYS } from './data/generate';
+import { digestOf, localAlarms, setQueryCost } from './data/alarms';
 import {
-  SCALES,
-  buildTopology,
-  fetchChildren,
-  resetMockCache,
-  type ScaleKey,
-  type TopoSnapshot,
-} from './data/topo';
+  descendantPaths,
+  fetchLayer,
+  prefetchPath,
+  refreshLayer,
+  summarize as runSummary,
+} from './data/server';
+import type { Digest, LayerTopo, PathSeg, ScaleKey } from './data/model';
+import {
+  BUILTIN_KEYS,
+  CUSTOM_KEYS,
+  LAYOUT_META,
+  defaultLayoutForLayer,
+  type LayoutKey,
+} from './components/layouts';
 
-interface FullResult {
-  scale: ScaleKey;
+/* ------------------------------------------------------------ 视图状态 */
+
+interface ViewState {
+  key: string;
+  path: PathSeg[];
+  topo: LayerTopo;
+  layoutKey: LayoutKey;
+  highlightIds: string[];
+  digests: Map<string, Digest>;
+  loading: boolean;
   ms: number;
-  nodes: number;
-  edges: number;
-  bytes: number;
+  fromCache: boolean;
+  lodTier: number;
+  controller?: AbortController;
 }
 
-interface LazyResult {
-  scale: ScaleKey;
-  ms: number;
-  nodes: number;
-  bytes: number;
+const scale = ref<ScaleKey>('M');
+const views = ref<ViewState[]>([]);
+const logs = ref<string[]>([]);
+const prefetchOn = ref(true);
+const busy = ref(false);
+
+const metrics = reactive({
+  fetches: 0,
+  cacheHits: 0,
+  aborts: 0,
+  lastMs: 0,
+  lastCache: false,
+  serialMs: 0,
+  serialQueries: 0,
+  parallelMs: 0,
+  parallelQueries: 0,
+  compared: false,
+});
+
+function log(msg: string) {
+  logs.value = [`${new Date().toLocaleTimeString('zh-CN', { hour12: false })} ${msg}`, ...logs.value].slice(0, 8);
 }
 
-interface TopoGraphExpose {
-  render(snapshot: TopoSnapshot): Promise<number>;
-  clearSafely(): Promise<void>;
-  setLayout(key: LayoutKey): void;
+const layoutOptions = computed(() => [
+  ...CUSTOM_KEYS.map((k) => ({ key: k as LayoutKey, ...LAYOUT_META[k] })),
+  ...BUILTIN_KEYS.map((k) => ({ key: k as LayoutKey, ...LAYOUT_META[k] })),
+]);
+
+const cacheSize = computed(() => {
+  const set = new Set(views.value.map((v) => `${scale.value}:${v.key}`));
+  return set.size;
+});
+
+/* ------------------------------------------------------------ 拉一层图 */
+
+function indexOf(view: ViewState): number {
+  return views.value.findIndex((v) => v.key === view.key);
 }
 
-/** 响应体字节数：懒加载的核心优势其实在这里 —— 首屏只需要传极少的数据 */
-function payloadBytes(snapshot: TopoSnapshot): number {
-  return new Blob([JSON.stringify(snapshot)]).size;
-}
+async function computeDigests(v: ViewState, signal: AbortSignal): Promise<void> {
+  const out = new Map<string, Digest>();
 
-function fmtBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
-}
-
-function fmtMs(ms: number): string {
-  if (ms >= 1000) return `${(ms / 1000).toFixed(1)} 秒`;
-  if (ms < 1) return '<1 ms';
-  return `${ms.toFixed(0)} ms`;
-}
-
-// 支持用查询参数直接进入某个对比场景，便于分享具体结论的链接，例如：
-//   ?scale=L&autorun=full   直接跑大规模全量渲染
-//   ?scale=S&autorun=lazy   直接跑小规模懒加载
-const QUERY = new URLSearchParams(window.location.search);
-const INITIAL_SCALE: ScaleKey = (() => {
-  const s = QUERY.get('scale');
-  return s === 'S' || s === 'M' || s === 'L' ? s : 'M';
-})();
-const AUTO_RUN = QUERY.get('autorun');
-
-function stamp(): string {
-  const d = new Date();
-  const p = (n: number) => String(n).padStart(2, '0');
-  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-}
-
-const graphRef = ref<TopoGraphExpose | null>(null);
-
-const mode = ref<'full' | 'lazy'>('full');
-const scaleKey = ref<ScaleKey>(INITIAL_SCALE);
-const layout = ref<LayoutKey>('dagre');
-const running = ref(false);
-const fullResult = ref<FullResult | null>(null);
-const lazyResult = ref<LazyResult | null>(null);
-const visibleNodes = ref(0);
-const visibleEdges = ref(0);
-const expandedSize = ref(0);
-const requests = ref(0);
-const cacheHits = ref(0);
-const lastMs = ref<number | null>(null);
-const log = ref<string[]>([]);
-
-const scaleKeys = Object.keys(SCALES) as ScaleKey[];
-
-// 以下不参与响应式：完整快照、当前可见快照、已展开节点集合
-let full: TopoSnapshot | null = null;
-let visible: TopoSnapshot = { nodes: [], edges: [] };
-let expanded = new Set<string>();
-// 同步守卫：一键对比要串行跑完全量再跑懒加载，只看 running 会被上一次的值拦掉
-let busy = false;
-
-function setBusy(v: boolean) {
-  busy = v;
-  running.value = v;
-}
-
-function pushLog(text: string) {
-  log.value = [`${stamp()}  ${text}`, ...log.value].slice(0, 12);
-}
-
-// 让浏览器先把「渲染中」的 UI 画出来，再开始同步布局。
-// 这里用 setTimeout 而不是 requestAnimationFrame：rAF 在无头/后台标签页里
-// 可能永不触发，会让渲染流程卡死；定时器在任何环境下都能推进。
-function nextFrame() {
-  return new Promise<void>((resolve) => setTimeout(resolve, 0));
-}
-
-function onSelectScale(k: ScaleKey) {
-  if (busy) return;
-  scaleKey.value = k;
-}
-
-async function runFull() {
-  if (busy) return;
-  setBusy(true);
-  try {
-    mode.value = 'full';
-    expanded = new Set();
-    expandedSize.value = 0;
-    resetMockCache();
-    pushLog(`开始全量渲染 · ${SCALES[scaleKey.value].label}`);
-    // 先清干净画布再计时，避免上一次遗留的大量节点销毁成本混进来
-    await graphRef.value?.clearSafely();
-    await nextFrame();
-
-    const topo = buildTopology(scaleKey.value);
-    full = topo;
-    visible = { nodes: topo.nodes, edges: topo.edges };
-    visibleNodes.value = topo.nodes.length;
-    visibleEdges.value = topo.edges.length;
-
-    const ms = (await graphRef.value?.render(topo)) ?? 0;
-    lastMs.value = ms;
-    fullResult.value = {
-      scale: scaleKey.value,
-      ms,
-      nodes: topo.nodes.length,
-      edges: topo.edges.length,
-      bytes: payloadBytes(topo),
-    };
-    pushLog(`全量渲染完成：${topo.nodes.length} 节点 / ${topo.edges.length} 边，布局+绘制合计 ${fmtMs(ms)}`);
-  } finally {
-    setBusy(false);
-  }
-}
-
-async function runLazy() {
-  if (busy) return;
-  setBusy(true);
-  try {
-    mode.value = 'lazy';
-    expanded = new Set();
-    expandedSize.value = 0;
-    resetMockCache();
-
-    const topo = buildTopology(scaleKey.value);
-    full = topo;
-    pushLog(`开始分层懒加载 · ${SCALES[scaleKey.value].label}，仅请求根层级`);
-
-    // 同样先清空再计时：懒加载测的是"从零开始的首屏"，不是"拆掉旧图的速度"
-    await graphRef.value?.clearSafely();
-    await nextFrame();
-
-    const rootRes = await fetchChildren(topo, null, 45);
-    let merged: TopoSnapshot = rootRes.snapshot;
-    let requestCount = 1;
-    let cacheHit = rootRes.fromCache ? 1 : 0;
-    let bytes = payloadBytes(rootRes.snapshot);
-
-    // 首屏再多拉一跳（核心 -> 汇聚），避免打开页面只看到一个孤立的点。
-    // 更下面的层级全部靠点击节点逐层下钻，不会一次性回来。
-    const rootNode = merged.nodes[0];
-    if (rootNode) {
-      const level1 = await fetchChildren(topo, rootNode.id, 45);
-      merged = {
-        nodes: [...merged.nodes, ...level1.snapshot.nodes],
-        edges: [...merged.edges, ...level1.snapshot.edges],
-      };
-      requestCount += 1;
-      bytes += payloadBytes(level1.snapshot);
-      if (level1.fromCache) cacheHit += 1;
+  // 单板层近千个图元，逐个递归汇总没有意义：只按本层告警落色与角标
+  if (v.topo.layer === 4) {
+    const byObject = new Map<string, ReturnType<typeof localAlarms>>();
+    for (const a of localAlarms(v.topo)) {
+      const list = byObject.get(a.objectId);
+      if (list) list.push(a);
+      else byObject.set(a.objectId, [a]);
     }
-
-    visible = merged;
-    visibleNodes.value = merged.nodes.length;
-    visibleEdges.value = merged.edges.length;
-    requests.value = requestCount;
-    cacheHits.value = cacheHit;
-
-    const ms = (await graphRef.value?.render(merged)) ?? 0;
-    lastMs.value = ms;
-    lazyResult.value = { scale: scaleKey.value, ms, nodes: merged.nodes.length, bytes };
-    pushLog(
-      `首屏完成：只请求核心与汇聚两层、渲染 ${merged.nodes.length} 个节点，用时 ${fmtMs(ms)}；更下层点节点再按需加载`,
-    );
-  } finally {
-    setBusy(false);
+    for (const [id, list] of byObject) out.set(id, digestOf(list));
+    v.digests = out;
+    return;
   }
+
+  const tasks: Promise<[string, Digest]>[] = [];
+  for (const n of v.topo.nodes) {
+    tasks.push(
+      runSummary(v.path, n.id, 'node', scale.value, 'parallel', signal).then(
+        (r) => [n.id, digestOf(r.alarms)] as [string, Digest],
+      ),
+    );
+  }
+  for (const l of v.topo.links) {
+    if (!l.drillable) continue;
+    tasks.push(
+      runSummary(v.path, l.id, 'link', scale.value, 'parallel', signal).then(
+        (r) => [l.id, digestOf(r.alarms)] as [string, Digest],
+      ),
+    );
+  }
+
+  const pairs = await Promise.all(tasks);
+  for (const [id, dg] of pairs) out.set(id, dg);
+  v.digests = out;
 }
 
-async function handleNodeClick(nodeId: string) {
-  if (mode.value !== 'lazy' || busy) return;
-  if (expanded.has(nodeId)) return;
-  if (!full) return;
-
-  const node = visible.nodes.find((n) => n.id === nodeId);
-  if (!node || node.childCount === 0) return;
-
-  setBusy(true);
+async function loadView(path: PathSeg[], signal: AbortSignal): Promise<ViewState | null> {
+  metrics.fetches += 1;
+  const t0 = performance.now();
   try {
-    const res = await fetchChildren(full, nodeId, 45);
-    requests.value += 1;
-    if (res.fromCache) cacheHits.value += 1;
+    const res = await fetchLayer(path, scale.value, { signal });
+    if (res.fromCache) metrics.cacheHits += 1;
 
-    const merged: TopoSnapshot = {
-      nodes: [...visible.nodes, ...res.snapshot.nodes],
-      edges: [...visible.edges, ...res.snapshot.edges],
+    const v: ViewState = {
+      key: pathKey(path),
+      path,
+      topo: res.topo,
+      layoutKey: defaultLayoutForLayer(res.topo.layer) as LayoutKey,
+      highlightIds: [],
+      digests: new Map(),
+      loading: false,
+      ms: res.ms,
+      fromCache: res.fromCache,
+      lodTier: -1,
+      controller: undefined,
     };
-    visible = merged;
-    visibleNodes.value = merged.nodes.length;
-    visibleEdges.value = merged.edges.length;
 
-    const ms = (await graphRef.value?.render(merged)) ?? 0;
-    lastMs.value = ms;
-    expanded.add(nodeId);
-    expandedSize.value = expanded.size;
-    pushLog(
-      `下钻 ${node.name}：新增 ${res.snapshot.nodes.length} 个子节点，渲染 ${fmtMs(ms)}${res.fromCache ? ' · 命中缓存' : ' · 回源'}；可见节点 ${merged.nodes.length}`,
-    );
-  } finally {
-    setBusy(false);
+    await computeDigests(v, signal);
+    metrics.lastMs = performance.now() - t0;
+    metrics.lastCache = res.fromCache;
+    return v;
+  } catch (err) {
+    if ((err as DOMException)?.name === 'AbortError') {
+      metrics.aborts += 1;
+      return null;
+    }
+    log(`加载失败：${String(err)}`);
+    return null;
   }
 }
 
-// 一键对比：先跑全量、再跑懒加载，最后直接给出同规模下的倍数。
-// 这是给访客最省事的入口 —— 点一次就能看到结论，不用自己记两个数字。
+/* ------------------------------------------------------------ 下钻逻辑 */
+
+async function drillLink(view: ViewState, linkId: string) {
+  const idx = indexOf(view);
+  if (idx < 0) return;
+
+  const link = findLink(view.topo, linkId);
+  if (!link || !link.drillable) return;
+
+  await openSubView(view, idx, { kind: 'link', id: link.id, label: link.label }, [linkId]);
+}
+
+async function drillDomain(view: ViewState, domainId: string) {
+  const idx = indexOf(view);
+  if (idx < 0) return;
+  const d = view.topo.domains.find((x) => x.id === domainId);
+  if (!d || !d.drillable) return;
+
+  await openSubView(view, idx, { kind: 'domain', id: d.id, label: d.name }, [domainId]);
+}
+
+async function enterBoard(view: ViewState) {
+  const idx = indexOf(view);
+  if (idx < 0 || !view.topo.canEnterBoard) return;
+
+  const seg: PathSeg = {
+    kind: 'detail',
+    id: `${pathKey(view.topo.path)}#detail`,
+    label: '整层全部单板',
+  };
+  await openSubView(view, idx, seg, []);
+}
+
+/**
+ * 在某层下面接一层。
+ *
+ * 两个关键动作：
+ *  1. 上一层的那个下钻请求（如果还在飞）立刻 abort —— 旧实现不取消不销毁，
+ *     等它回来还会把新图覆盖掉。
+ *  2. 同层被顶替：原来这一层下面的整棵子树全部销毁。
+ */
+async function openSubView(view: ViewState, idx: number, seg: PathSeg, highlightIds: string[]) {
+  // 中断这一层上仍在进行中的下钻
+  view.controller?.abort();
+  const ctrl = new AbortController();
+  view.controller = ctrl;
+
+  // 父层：新的高亮、旧的恢复默认
+  view.highlightIds = highlightIds;
+
+  // 同层被顶替，它下面所有层整棵销毁
+  for (const v of views.value.slice(idx + 1)) v.controller?.abort();
+  views.value.splice(idx + 1);
+
+  busy.value = true;
+  log(`下钻 ${seg.label} …`);
+  const sub = await loadView([...view.path, seg], ctrl.signal);
+  busy.value = false;
+  if (!sub) {
+    log(`已中断 ${seg.label}（请求被取消，不会覆盖新图）`);
+    return;
+  }
+
+  // 子层：把这条路径的入口端点标出来，一眼看出是"从哪进来的"
+  sub.highlightIds = sub.topo.nodes.filter((n) => n.entry).map((n) => n.id);
+  sub.controller = undefined;
+  views.value.push(sub);
+  log(`进入第 ${sub.topo.layer} 层 · ${sub.topo.nodes.length} 节点 / ${sub.topo.links.length} 链路`);
+}
+
+/** 关闭某一层：它自己 + 下面所有层一起销毁，父层高亮恢复默认 */
+function closeFrom(view: ViewState) {
+  const idx = indexOf(view);
+  if (idx <= 0) return;
+
+  for (const v of views.value.slice(idx)) v.controller?.abort();
+  views.value.splice(idx);
+
+  const parent = views.value[idx - 1];
+  if (parent) parent.highlightIds = [];
+  log(`关闭第 ${view.topo.layer} 层及以下`);
+}
+
+/** 刷新：只让当前这一层的缓存失效，父层子层都不动 */
+async function refresh(view: ViewState) {
+  const idx = indexOf(view);
+  if (idx < 0) return;
+
+  refreshLayer(view.path, scale.value);
+  log(`刷新第 ${view.topo.layer} 层（只失效本层缓存）`);
+
+  const ctrl = new AbortController();
+  view.controller?.abort();
+  view.controller = ctrl;
+  view.loading = true;
+
+  const fresh = await loadView(view.path, ctrl.signal);
+  view.loading = false;
+  if (!fresh) return;
+
+  // 只替换这一层的数据，下面挂着的子层不动
+  view.topo = fresh.topo;
+  view.digests = fresh.digests;
+  view.ms = fresh.ms;
+  view.fromCache = fresh.fromCache;
+  log(`第 ${view.topo.layer} 层已刷新${fresh.fromCache ? '（命中缓存）' : ''}`);
+}
+
+function setLayout(view: ViewState, key: LayoutKey) {
+  view.layoutKey = key;
+}
+
+function onLod(view: ViewState, tier: number) {
+  view.lodTier = tier;
+}
+
+/* ------------------------------------------------------------ 切换规模 */
+
+async function resetAll() {
+  for (const v of views.value) v.controller?.abort();
+  views.value = [];
+  metrics.fetches = 0;
+  metrics.cacheHits = 0;
+  metrics.aborts = 0;
+  metrics.compared = false;
+
+  const ctrl = new AbortController();
+  const root = await loadView([], ctrl.signal);
+  if (root) views.value = [root];
+  log(`已重置为「${SCALES[scale.value].label}」`);
+  if (prefetchOn.value) void startPrefetch();
+}
+
+/* ------------------------------------------------------------ 空闲预取 */
+
+function idle(): Promise<void> {
+  return new Promise((resolve) => {
+    const ric = (window as unknown as { requestIdleCallback?: (cb: () => void) => number })
+      .requestIdleCallback;
+    if (ric) ric(() => resolve());
+    else window.setTimeout(resolve, 60);
+  });
+}
+
+/**
+ * 页面空闲时把当前拓扑下面整棵子树的数据提前拉回本地缓存。
+ * 用户感受不到；缓存没就绪时点下钻照样能走小请求，不阻塞。
+ */
+async function startPrefetch() {
+  if (!prefetchOn.value || views.value.length === 0) return;
+  const root = views.value[0];
+  const paths = descendantPaths(root.path, scale.value, 2);
+  if (paths.length === 0) return;
+
+  log(`空闲预取 ${paths.length} 条子路径…`);
+  const ctrl = new AbortController();
+  let i = 0;
+
+  while (i < paths.length) {
+    // 用户一交互就抢占，预取让路
+    if (busy.value) {
+      ctrl.abort();
+      log('预取被交互抢占，已让路');
+      return;
+    }
+    const batch = paths.slice(i, i + 3);
+    i += batch.length;
+    await Promise.all(batch.map((p) => prefetchPath(p, scale.value, ctrl.signal)));
+    await idle();
+  }
+  log(`预取完成，缓存 ${paths.length} 条`);
+}
+
+/* ------------------------------------------------------------ 串行/并行对比 */
+
 async function runCompare() {
-  if (busy) return;
-  await graphRef.value?.clearSafely();
-  log.value = [];
-  fullResult.value = null;
-  lazyResult.value = null;
-  await runFull();
-  await runLazy();
+  const root = views.value[0];
+  if (!root || metrics.compared) return;
+
+  const target =
+    root.topo.nodes.find((n) => n.drillLinks.length > 0) ?? root.topo.nodes[0];
+  if (!target) return;
+
+  log(`对比汇总：${target.name} 的完整子树`);
+  setQueryCost(15);
+
+  const serial = await runSummary(root.path, target.id, 'node', scale.value, 'serial');
+  metrics.serialMs = serial.ms;
+  metrics.serialQueries = serial.queries;
+
+  const parallel = await runSummary(root.path, target.id, 'node', scale.value, 'parallel');
+  metrics.parallelMs = parallel.ms;
+  metrics.parallelQueries = parallel.queries;
+
+  setQueryCost(0);
+  metrics.compared = true;
+  log(
+    `串行 ${serial.queries} 次 / ${serial.ms.toFixed(0)}ms，并行 ${parallel.queries} 次 / ${parallel.ms.toFixed(0)}ms`,
+  );
 }
 
-function handleLayout(key: LayoutKey) {
-  layout.value = key; // 子组件监听 layout 变化后自己换布局层，图实例不重建
-  pushLog(`切换布局 -> ${LAYOUT_LABELS[key]}（图组件不重建，只换布局层）`);
-}
+/* ------------------------------------------------------------ 启动 */
 
-function reset() {
-  void graphRef.value?.clearSafely();
-  visible = { nodes: [], edges: [] };
-  full = null;
-  expanded = new Set();
-  resetMockCache();
-  visibleNodes.value = 0;
-  visibleEdges.value = 0;
-  expandedSize.value = 0;
-  requests.value = 0;
-  cacheHits.value = 0;
-  lastMs.value = null;
-  fullResult.value = null;
-  lazyResult.value = null;
-  log.value = [];
-}
-
-const ratio = computed(() => {
-  const f = fullResult.value;
-  const l = lazyResult.value;
-  if (!f || !l || f.scale !== l.scale) return null;
-  return l.ms > 0 ? f.ms / l.ms : null;
-});
-
-const byteRatio = computed(() => {
-  const f = fullResult.value;
-  const l = lazyResult.value;
-  if (!f || !l || f.scale !== l.scale) return null;
-  return l.bytes > 0 ? f.bytes / l.bytes : null;
-});
-
-// 首屏自动跑一次：访客打开页面即可看到拓扑，而不是一张空白画布
-onMounted(() => {
-  setTimeout(() => {
-    if (AUTO_RUN === 'full') void runFull();
-    else void runLazy();
-  }, 500);
+onMounted(async () => {
+  setQueryCost(0);
+  await resetAll();
 });
 </script>
 
 <template>
   <div class="app">
-    <aside class="panel">
-      <header class="brand">
-        <h1>net-topo-lab</h1>
-        <p>多层拓扑的分层懒加载与布局解耦演示</p>
-        <p class="disclaimer">
-          拓扑数据由程序合成生成，不含任何前雇主 / 客户 / 运营商的真实网络数据。
-        </p>
-      </header>
+    <aside class="side">
+      <h1>网络拓扑多层下钻</h1>
+      <p class="decl">
+        演示项目。结构与交互按真实业务重建，<b>所有网元、链路、单板、告警均为程序合成</b>，
+        不含任何真实网络数据、客户信息或公司代码。
+      </p>
 
       <section class="block">
-        <h2>1. 选择数据规模</h2>
-        <div class="segmented">
+        <h2>规模</h2>
+        <div class="chips">
           <button
-            v-for="k in scaleKeys"
+            v-for="k in SCALE_KEYS"
             :key="k"
-            :class="['seg', k === scaleKey ? 'active' : '']"
-            :disabled="running"
-            @click="onSelectScale(k)"
+            class="chip"
+            :class="{ on: scale === k }"
+            @click="scale = k; resetAll()"
           >
             {{ SCALES[k].label }}
           </button>
         </div>
-        <p class="hint">{{ SCALES[scaleKey].hint }}</p>
+        <p class="hint">{{ SCALES[scale].hint }}</p>
       </section>
 
       <section class="block">
-        <h2>2. 跑一次对比</h2>
-        <button class="btn btn-compare" :disabled="running" @click="runCompare">
-          一键对比（先全量、再懒加载）
-        </button>
-        <div class="actions">
-          <button class="btn btn-full" :disabled="running" @click="runFull">
-            只跑全量（旧实现）
-          </button>
-          <button class="btn btn-lazy" :disabled="running" @click="runLazy">
-            只跑懒加载（优化后）
-          </button>
-        </div>
+        <h2>层级结构</h2>
+        <ul class="tree">
+          <li><b>第1层</b> 主干链路（子网与中间设备被抽象掉）</li>
+          <li><b>第2~3层</b> 点链路 / 点域展开：两端点 + 2~3 条并行路径</li>
+          <li><b>第4层</b> 整层「详情」展开：上一层的全部网元与端口的单板</li>
+        </ul>
+        <p class="hint">每层固定 340px 高，纵向堆叠，超出整页滚动；切换分支时旧子树整棵销毁。</p>
+      </section>
+
+      <section class="block">
+        <h2>前端优化</h2>
+        <label class="sw">
+          <input v-model="prefetchOn" type="checkbox" @change="prefetchOn && startPrefetch()" />
+          空闲预取（页面闲下来提前拉子树）
+        </label>
         <p class="hint">
-          一键对比会自动跑完两遍，右下角给出同规模下的倍数。规模选「大」时全量约 1 秒量级，具体取决于机器性能。
+          缓存命中后下钻走短请求；缓存没就绪时也不阻塞，直接走小请求只拉需要的子树。
+          点另一条链路会立刻中断还在飞的请求。
         </p>
       </section>
 
       <section class="block">
-        <h2>3. 切换布局</h2>
-        <div class="layouts">
-          <button
-            v-for="k in LAYOUT_KEYS"
-            :key="k"
-            :class="['chip', k === layout ? 'active' : '']"
-            @click="handleLayout(k)"
-          >
-            {{ LAYOUT_LABELS[k] }}
-          </button>
+        <h2>前后端对比</h2>
+        <button class="primary" :disabled="metrics.compared || busy" @click="runCompare">
+          {{ metrics.compared ? '已对比' : '一键对比串行 / 并行' }}
+        </button>
+        <table v-if="metrics.compared" class="cmp">
+          <thead>
+            <tr><th></th><th>子查询</th><th>耗时</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>串行（旧）</td><td>{{ metrics.serialQueries }}</td><td>{{ metrics.serialMs.toFixed(0) }} ms</td></tr>
+            <tr><td>并行（新）</td><td>{{ metrics.parallelQueries }}</td><td>{{ metrics.parallelMs.toFixed(0) }} ms</td></tr>
+          </tbody>
+        </table>
+        <p v-if="metrics.compared" class="hint">
+          同一个子树、同一次查询：串行要按顺序把每条兄弟分支都跑完；并行同时发出去，只等最慢的那条。
+        </p>
+      </section>
+
+      <section class="block">
+        <h2>指标</h2>
+        <div class="kv">
+          <div class="row"><span class="k">层数</span><span class="v">{{ views.length }} / 4</span></div>
+          <div class="row"><span class="k">取数次数</span><span class="v">{{ metrics.fetches }}</span></div>
+          <div class="row"><span class="k">缓存命中</span><span class="v">{{ metrics.cacheHits }}</span></div>
+          <div class="row"><span class="k">中断次数</span><span class="v">{{ metrics.aborts }}</span></div>
+          <div class="row"><span class="k">本次耗时</span><span class="v">{{ metrics.lastMs.toFixed(0) }} ms</span></div>
+          <div class="row"><span class="k">本层缓存</span><span class="v">{{ metrics.lastCache ? '命中' : '回源' }}</span></div>
         </div>
-        <p class="hint">懒加载模式下点节点可逐层下钻；切布局时图组件不重建，只替换布局层。</p>
       </section>
 
       <section class="block">
-        <h2>运行指标</h2>
-        <dl class="metrics">
-          <dt>可见节点</dt>
-          <dd>{{ visibleNodes }}</dd>
-          <dt>可见边</dt>
-          <dd>{{ visibleEdges }}</dd>
-          <dt>最近一次渲染</dt>
-          <dd>{{ lastMs === null ? '—' : fmtMs(lastMs) }}</dd>
-          <dt>接口请求数</dt>
-          <dd>{{ requests }}</dd>
-          <dt>缓存命中</dt>
-          <dd>{{ cacheHits }}</dd>
-          <dt>已展开层级</dt>
-          <dd>{{ expandedSize }} 个节点</dd>
-        </dl>
-        <button class="btn btn-ghost" :disabled="running" @click="reset">重置</button>
-      </section>
-
-      <section class="block">
-        <h2>操作日志</h2>
+        <h2>日志</h2>
         <ul class="log">
-          <li v-if="log.length === 0" class="log-empty">还没有操作记录</li>
-          <li v-for="(line, i) in log" :key="i">{{ line }}</li>
+          <li v-for="(l, i) in logs" :key="i">{{ l }}</li>
         </ul>
       </section>
     </aside>
 
-    <main class="stage">
-      <TopoGraph ref="graphRef" :layout="layout" @node-click="handleNodeClick" />
+    <main class="stack">
+      <section v-for="(v, i) in views" :key="v.key" class="view">
+        <header class="vhead">
+          <div class="vtitles">
+            <div class="vt">{{ v.topo.title }}</div>
+            <div class="vs">{{ v.topo.subtitle }}</div>
+            <div class="crumbs">
+              <span>主干拓扑</span>
+              <span v-for="(seg, k) in v.path" :key="k"> › {{ seg.label }}</span>
+            </div>
+          </div>
 
-      <div v-if="fullResult || lazyResult" class="compare">
-        <div v-if="fullResult" class="compare-card full">
-          <span class="tag">全量渲染（一次拉全量）</span>
-          <strong>{{ fmtMs(fullResult.ms) }}</strong>
-          <small>
-            {{ fullResult.nodes }} 节点 / {{ fullResult.edges }} 边 · 数据
-            {{ fmtBytes(fullResult.bytes) }}
-          </small>
-        </div>
-        <div v-if="lazyResult" class="compare-card lazy">
-          <span class="tag">懒加载首屏</span>
-          <strong>{{ fmtMs(lazyResult.ms) }}</strong>
-          <small>{{ lazyResult.nodes }} 节点 · 首屏数据 {{ fmtBytes(lazyResult.bytes) }}</small>
-        </div>
-        <div v-if="ratio !== null && byteRatio !== null" class="compare-card ratio">
-          <span class="tag">同规模差距</span>
-          <strong>{{ byteRatio.toFixed(0) }}×</strong>
-          <small>首屏数据量小 {{ byteRatio.toFixed(0) }} 倍，渲染快 {{ ratio.toFixed(0) }} 倍</small>
-        </div>
-      </div>
+          <div class="vops">
+            <span class="stat">{{ v.topo.nodes.length }} 节点 · {{ v.topo.links.length }} 链路 · {{ v.ms.toFixed(0) }}ms</span>
+            <button v-if="v.topo.canEnterBoard" class="cta" @click="enterBoard(v)">详情：全部网元单板</button>
+            <button class="op" @click="refresh(v)">{{ v.loading ? '刷新中…' : '刷新本层' }}</button>
+            <button v-if="i > 0" class="op" @click="closeFrom(v)">关闭</button>
+          </div>
+        </header>
 
-      <div v-if="running" class="running">渲染中…大规模型下会明显卡顿</div>
+        <div class="lbar">
+          <button
+            v-for="opt in layoutOptions"
+            :key="opt.key"
+            class="lchip"
+            :class="{ on: v.layoutKey === opt.key, builtin: opt.kind === 'builtin' }"
+            :title="opt.hint"
+            @click="setLayout(v, opt.key)"
+          >
+            {{ opt.label }}
+          </button>
+          <span class="lod">LOD 档 {{ v.lodTier < 0 ? '—' : v.lodTier }}</span>
+        </div>
+
+        <TopoGraph
+          :topo="v.topo"
+          :layout-key="v.layoutKey"
+          :height="340"
+          :highlight-ids="v.highlightIds"
+          :digests="v.digests"
+          @drill-link="(id: string) => drillLink(v, id)"
+          @drill-domain="(id: string) => drillDomain(v, id)"
+          @lod-change="(t: number) => onLod(v, t)"
+        />
+      </section>
+
+      <p v-if="views.length === 0" class="empty">正在加载拓扑演示…</p>
     </main>
   </div>
 </template>
