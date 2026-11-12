@@ -2,7 +2,7 @@
 
 多层网络拓扑的**分层懒加载**与**布局层解耦**演示。
 
-React 18 + TypeScript + [AntV G6 5.x](https://g6.antv.antgroup.com/)，可跑在浏览器里，也能直接部署到静态托管。
+Vue 3（`<script setup>` + TypeScript）+ [AntV G6 5.x](https://g6.antv.antgroup.com/)，可跑在浏览器里，也能直接部署到静态托管。
 
 ---
 
@@ -49,7 +49,7 @@ npm run dev      # http://localhost:5180
 其他命令：
 
 ```bash
-npm run typecheck   # tsc --noEmit
+npm run typecheck   # vue-tsc --noEmit，含 .vue 单文件组件
 npm run build       # 产物在 dist/，base 已设为 './'，可直接静态托管
 npm run preview     # 本地预览构建产物
 ```
@@ -69,14 +69,17 @@ http://localhost:5180/?scale=S&autorun=lazy    # 直接跑小规模懒加载
 
 ```
 src/
-├─ data/topo.ts            # 合成拓扑生成（确定性 LCG 种子）、三档规模、mock 懒加载接口
-├─ components/TopoGraph.tsx # G6 5.x 封装：渲染、换布局、清空、节点点击
-├─ App.tsx                  # 面板、对比逻辑、下钻与指标统计
+├─ data/topo.ts              # 合成拓扑生成（确定性 LCG 种子）、三档规模、mock 懒加载接口
+├─ components/
+│  ├─ layouts.ts             # 布局层配置：换布局只改这里，图组件不动
+│  └─ TopoGraph.vue          # G6 5.x 封装：渲染、换布局、清空、节点点击（emit 上报）
+├─ App.vue                   # 面板、对比逻辑、下钻与指标统计
 ├─ index.css
-└─ main.tsx
+└─ main.ts
 scripts/
-├─ verify.mjs              # 真机跑全量 / 懒加载，读取真实计时
-└─ snapshot.mjs            # 点「一键对比」后截图
+├─ verify.mjs                # 真机跑全量 / 懒加载，读取真实计时
+├─ snapshot.mjs              # 点「一键对比」后截图
+└─ check-interaction.mjs     # 验证下钻与布局切换链路
 ```
 
 数据模型是五个层级：
