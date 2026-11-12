@@ -55,7 +55,7 @@ const LEVEL_SPEC: LevelSpec[] = [
 export const SCALES: Record<ScaleKey, { label: string; counts: number[]; hint: string }> = {
   S: { label: '小规模 · 600 节点', counts: [1, 4, 16, 64, 512], hint: '全量渲染也很快，用来做基线' },
   M: { label: '中规模 · 1800 节点', counts: [1, 8, 32, 160, 1600], hint: '推荐：差距最直观' },
-  L: { label: '大规模 · 5250 节点', counts: [1, 8, 40, 200, 5000], hint: '全量模式会明显卡顿，这就是旧实现的问题' },
+  L: { label: '大规模 · 5250 节点', counts: [1, 8, 40, 200, 5000], hint: '全量模式要 1 秒以上才出画面，这就是旧实现的问题' },
 };
 
 export const LAYER_NAMES = LEVEL_SPEC.map((l) => l.label);
